@@ -1,0 +1,24 @@
+[package]
+name = "blockchain-rs"
+version = "0.1.0"
+authors = ["Jay"]
+description = "A simplified blockchain implementation in rust for learning"
+edition = "2024"
+readme = "README.md"
+license = "MIT"
+keywords = ["blockchain", "simplified"]
+
+
+[dependencies]
+sha2 = "0.10.9"
+rust-crypto = "^0.2"
+wincode = "0.2.5"
+failure = "0.1"
+sled = "0.34"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11.8"
+clap = "4.5.53"
+bitcoincash-addr = "0.5.2"
+rand = "0.9.2"
+merkle-cbt = "0.3.2"
