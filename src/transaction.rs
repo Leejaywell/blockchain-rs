@@ -3,17 +3,16 @@
 use super::*;
 use crate::utxoset::*;
 use crate::wallets::*;
-use wincode::serialize;
+use bincode::serialize;
 use bitcoincash_addr::Address;
-use crypto::digest::Digest;
-use crypto::ed25519;
-use crypto::sha2::Sha256;
-use failure::format_err;
-use rand::Rng;
+use sha2::{Sha256, Digest};
+use ed25519_dalek::{SigningKey, Verifier, VerifyingKey, Signature, Signer};
+use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const SUBSIDY: i32 = 10;
+const SUBSIDY: i32 = 50;
+const HALVING_INTERVAL: i32 = 100;
 
 /// TXInput represents a transaction input
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -46,6 +45,16 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// GetReward calculates the coinbase reward based on height
+    pub fn get_reward(height: i32) -> i32 {
+        let mut reward = SUBSIDY;
+        let halvings = height / HALVING_INTERVAL;
+        for _ in 0..halvings {
+            reward /= 2;
+        }
+        reward
+    }
+
     /// NewUTXOTransaction creates a new transaction
     pub fn new_UTXO(wallet: &Wallet, to: &str, amount: i32, utxo: &UTXOSet) -> Result<Transaction> {
         info!(
@@ -62,7 +71,7 @@ impl Transaction {
 
         if acc_v.0 < amount {
             error!("Not Enough balance");
-            return Err(format_err!(
+            return Err(anyhow!(
                 "Not Enough balance: current balance {}",
                 acc_v.0
             ));
@@ -96,17 +105,18 @@ impl Transaction {
         Ok(tx)
     }
 
-    /// NewCoinbaseTX creates a new coinbase transaction
-    pub fn new_coinbase(to: String, mut data: String) -> Result<Transaction> {
-        info!("new coinbase Transaction to: {}", to);
+    /// NewCoinbaseTX creates a new coinbase transaction with fees
+    pub fn new_coinbase(to: String, mut data: String, height: i32, fees: i32) -> Result<Transaction> {
+        info!("new coinbase Transaction to: {} at height {} with fees {}", to, height, fees);
         let mut key: [u8; 32] = [0; 32];
         if data.is_empty() {
-            let mut rand = rand::OsRng::new().unwrap();
-            rand.fill_bytes(&mut key);
+            rand::fill(&mut key);
             data = format!("Reward to '{}'", to);
         }
         let mut pub_key = Vec::from(data.as_bytes());
         pub_key.append(&mut Vec::from(key));
+
+        let reward = Self::get_reward(height) + fees;
 
         let mut tx = Transaction {
             id: String::new(),
@@ -116,7 +126,7 @@ impl Transaction {
                 signature: Vec::new(),
                 pub_key,
             }],
-            vout: vec![TXOutput::new(SUBSIDY, to)?],
+            vout: vec![TXOutput::new(reward, to)?],
         };
         tx.id = tx.hash()?;
         Ok(tx)
@@ -135,7 +145,7 @@ impl Transaction {
 
         for vin in &self.vin {
             if prev_TXs.get(&vin.txid).unwrap().id.is_empty() {
-                return Err(format_err!("ERROR: Previous transaction is not correct"));
+                return Err(anyhow!("ERROR: Previous transaction is not correct"));
             }
         }
 
@@ -150,11 +160,22 @@ impl Transaction {
             tx_copy.id = tx_copy.hash()?;
             tx_copy.vin[in_id].pub_key = Vec::new();
 
-            if !ed25519::verify(
-                &tx_copy.id.as_bytes(),
-                &self.vin[in_id].pub_key,
-                &self.vin[in_id].signature,
-            ) {
+            let verifying_key = VerifyingKey::from_bytes(
+                self.vin[in_id]
+                    .pub_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|e| anyhow!("{:?}", e))?,
+            )
+            .map_err(|e| anyhow!("{:?}", e))?;
+            let signature = Signature::from_bytes(
+                self.vin[in_id]
+                    .signature
+                    .as_slice()
+                    .try_into()
+                    .map_err(|e| anyhow!("{:?}", e))?,
+            );
+            if verifying_key.verify(tx_copy.id.as_bytes(), &signature).is_err() {
                 return Ok(false);
             }
         }
@@ -174,7 +195,7 @@ impl Transaction {
 
         for vin in &self.vin {
             if prev_TXs.get(&vin.txid).unwrap().id.is_empty() {
-                return Err(format_err!("ERROR: Previous transaction is not correct"));
+                return Err(anyhow!("ERROR: Previous transaction is not correct"));
             }
         }
 
@@ -188,8 +209,13 @@ impl Transaction {
                 .clone();
             tx_copy.id = tx_copy.hash()?;
             tx_copy.vin[in_id].pub_key = Vec::new();
-            let signature = ed25519::signature(tx_copy.id.as_bytes(), private_key);
-            self.vin[in_id].signature = signature.to_vec();
+            let signing_key = SigningKey::from_bytes(
+                private_key
+                    .try_into()
+                    .map_err(|e| anyhow!("{:?}", e))?,
+            );
+            let signature = signing_key.sign(tx_copy.id.as_bytes());
+            self.vin[in_id].signature = signature.to_bytes().to_vec();
         }
 
         Ok(())
@@ -201,8 +227,8 @@ impl Transaction {
         copy.id = String::new();
         let data = serialize(&copy)?;
         let mut hasher = Sha256::new();
-        hasher.input(&data[..]);
-        Ok(hasher.result_str())
+        hasher.update(&data[..]);
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     /// TrimmedCopy creates a trimmed copy of Transaction to be used in signing
@@ -270,10 +296,12 @@ mod test {
         drop(ws);
 
         let data = String::from("test");
-        let tx = Transaction::new_coinbase(wa1, data).unwrap();
+        let tx = Transaction::new_coinbase(wa1, data, 0, 0).unwrap();
         assert!(tx.is_coinbase());
 
-        let signature = ed25519::signature(tx.id.as_bytes(), &w.secret_key);
-        assert!(ed25519::verify(tx.id.as_bytes(), &w.public_key, &signature));
+        let signing_key = SigningKey::from_bytes(w.secret_key.as_slice().try_into().unwrap());
+        let signature = signing_key.sign(tx.id.as_bytes());
+        let verifying_key = VerifyingKey::from_bytes(w.public_key.as_slice().try_into().unwrap()).unwrap();
+        assert!(verifying_key.verify(tx.id.as_bytes(), &signature).is_ok());
     }
 }

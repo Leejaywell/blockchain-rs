@@ -4,12 +4,14 @@ use super::*;
 use crate::block::*;
 use crate::transaction::*;
 use bincode::{deserialize, serialize};
-use failure::format_err;
+use anyhow::anyhow;
 use sled;
 use std::collections::HashMap;
 
 const GENESIS_COINBASE_DATA: &str =
     "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks";
+const DIFFICULTY_ADJUSTMENT_INTERVAL: i32 = 10;
+const EXPECTED_BLOCK_TIME: u128 = 1000 * 60; // 1 minute in milliseconds
 
 /// Blockchain implements interactions with a DB
 #[derive(Debug)]
@@ -50,7 +52,7 @@ impl Blockchain {
         std::fs::remove_dir_all("data/blocks").ok();
         let db = sled::open("data/blocks")?;
         debug!("Creating new block database");
-        let cbtx = Transaction::new_coinbase(address, String::from(GENESIS_COINBASE_DATA))?;
+        let cbtx = Transaction::new_coinbase(address, String::from(GENESIS_COINBASE_DATA), 0, 0)?;
         let genesis: Block = Block::new_genesis_block(cbtx);
         db.insert(genesis.get_hash(), serialize(&genesis)?)?;
         db.insert("LAST", genesis.get_hash().as_bytes())?;
@@ -68,16 +70,21 @@ impl Blockchain {
 
         for tx in &transactions {
             if !self.verify_transacton(tx)? {
-                return Err(format_err!("ERROR: Invalid transaction"));
+                return Err(anyhow!("ERROR: Invalid transaction"));
             }
         }
 
         let lasthash = self.db.get("LAST")?.unwrap();
+        let last_data = self.db.get(lasthash)?.unwrap();
+        let last_block: Block = deserialize(&last_data.to_vec())?;
+        let height = last_block.get_height() + 1;
+        let difficulty = self.calculate_difficulty(&last_block)?;
 
         let newblock = Block::new_block(
             transactions,
-            String::from_utf8(lasthash.to_vec())?,
-            self.get_best_height()? + 1,
+            last_block.get_hash(),
+            height,
+            difficulty,
         )?;
         self.db.insert(newblock.get_hash(), serialize(&newblock)?)?;
         self.db.insert("LAST", newblock.get_hash().as_bytes())?;
@@ -87,8 +94,36 @@ impl Blockchain {
         Ok(newblock)
     }
 
+    fn calculate_difficulty(&self, last_block: &Block) -> Result<usize> {
+        let height = last_block.get_height();
+        if height > 0 && (height + 1) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 {
+            let prev_adjustment_block = self.get_block_by_height(height - DIFFICULTY_ADJUSTMENT_INTERVAL + 2)?;
+            let time_expected = EXPECTED_BLOCK_TIME * DIFFICULTY_ADJUSTMENT_INTERVAL as u128;
+            let time_taken = last_block.get_timestamp() - prev_adjustment_block.get_timestamp();
+
+            let mut difficulty = last_block.get_difficulty();
+            if time_taken < time_expected / 2 {
+                difficulty += 1;
+            } else if time_taken > time_expected * 2 && difficulty > 1 {
+                difficulty -= 1;
+            }
+            info!("Difficulty adjusted to: {}", difficulty);
+            return Ok(difficulty);
+        }
+        Ok(last_block.get_difficulty())
+    }
+
+    fn get_block_by_height(&self, height: i32) -> Result<Block> {
+        for block in self.iter() {
+            if block.get_height() == height {
+                return Ok(block);
+            }
+        }
+        Err(anyhow!("Block not found at height {}", height))
+    }
+
     /// Iterator returns a BlockchainIterat
-    pub fn iter(&self) -> BlockchainIterator {
+    pub fn iter(&self) -> BlockchainIterator<'_> {
         BlockchainIterator {
             current_hash: self.tip.clone(),
             bc: &self,
@@ -151,7 +186,7 @@ impl Blockchain {
                 }
             }
         }
-        Err(format_err!("Transaction is not found"))
+        Err(anyhow!("Transaction is not found"))
     }
 
     fn get_prev_TXs(&self, tx: &Transaction) -> Result<HashMap<String, Transaction>> {

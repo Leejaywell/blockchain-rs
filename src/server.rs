@@ -4,8 +4,8 @@ use super::*;
 use crate::block::*;
 use crate::transaction::*;
 use crate::utxoset::*;
-use wincode::{deserialize, serialize};
-use failure::format_err;
+use bincode::{deserialize, serialize};
+use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::prelude::*;
@@ -449,8 +449,9 @@ impl Server {
                         return Ok(());
                     }
 
+                    let height = self.get_best_height()? + 1;
                     let cbtx =
-                        Transaction::new_coinbase(self.mining_address.clone(), String::new())?;
+                        Transaction::new_coinbase(self.mining_address.clone(), String::new(), height, 0)?;
                     txs.push(cbtx);
 
                     for tx in &txs {
@@ -539,7 +540,7 @@ fn bytes_to_cmd(bytes: &[u8]) -> Result<Message> {
         let data: Versionmsg = deserialize(data)?;
         Ok(Message::Version(data))
     } else {
-        Err(format_err!("Unknown command in the server"))
+        Err(anyhow!("Unknown command in the server"))
     }
 }
 

@@ -3,11 +3,9 @@
 use super::*;
 use bincode::{deserialize, serialize};
 use bitcoincash_addr::*;
-use crypto::digest::Digest;
-use crypto::ed25519;
-use crypto::ripemd160::Ripemd160;
-use crypto::sha2::Sha256;
-use rand::Rng;
+use sha2::{Sha256, Digest};
+use ripemd::Ripemd160;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use sled;
 use std::collections::HashMap;
@@ -22,11 +20,10 @@ impl Wallet {
     /// NewWallet creates and returns a Wallet
     fn new() -> Self {
         let mut key: [u8; 32] = [0; 32];
-        let mut rand = rand::OsRng::new().unwrap();
-        rand.fill_bytes(&mut key);
-        let (secret_key, public_key) = ed25519::keypair(&key);
-        let secret_key = secret_key.to_vec();
-        let public_key = public_key.to_vec();
+        rand::fill(&mut key);
+        let signing_key = SigningKey::from_bytes(&key);
+        let public_key = signing_key.verifying_key().to_bytes().to_vec();
+        let secret_key = signing_key.to_bytes().to_vec();
         Wallet {
             secret_key,
             public_key,
@@ -50,12 +47,13 @@ impl Wallet {
 /// HashPubKey hashes public key
 pub fn hash_pub_key(pubKey: &mut Vec<u8>) {
     let mut hasher1 = Sha256::new();
-    hasher1.input(pubKey);
-    hasher1.result(pubKey);
+    hasher1.update(pubKey.as_slice());
+    let result1 = hasher1.finalize();
+
     let mut hasher2 = Ripemd160::new();
-    hasher2.input(pubKey);
-    pubKey.resize(20, 0);
-    hasher2.result(pubKey);
+    hasher2.update(result1);
+    let result2 = hasher2.finalize();
+    *pubKey = result2.to_vec();
 }
 
 pub struct Wallets {
@@ -121,6 +119,7 @@ impl Wallets {
 #[cfg(test)]
 mod test {
     use super::*;
+    use ed25519_dalek::{VerifyingKey, Verifier, Signer};
 
     #[test]
     fn test_create_wallet_and_hash() {
@@ -159,11 +158,9 @@ mod test {
     #[test]
     fn test_signature() {
         let w = Wallet::new();
-        let signature = ed25519::signature("test".as_bytes(), &w.secret_key);
-        assert!(ed25519::verify(
-            "test".as_bytes(),
-            &w.public_key,
-            &signature
-        ));
+        let signing_key = SigningKey::from_bytes(w.secret_key.as_slice().try_into().unwrap());
+        let signature = signing_key.sign("test".as_bytes());
+        let verifying_key = VerifyingKey::from_bytes(w.public_key.as_slice().try_into().unwrap()).unwrap();
+        assert!(verifying_key.verify("test".as_bytes(), &signature).is_ok());
     }
 }
